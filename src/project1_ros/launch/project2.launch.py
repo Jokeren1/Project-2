@@ -13,15 +13,14 @@ def generate_launch_description():
 
         Node(
             package='project1_ros',
-            executable='keyboard_control',
-            name='keyboard_control',
-            output='screen'
-        ),
-
-        Node(
-            package='project1_ros',
             executable='reactive_controller',
             name='reactive_controller',
-            output='screen'
+            output='screen',
+            parameters=[
+                {
+                    'cmd_vel_topic': '/cmd_vel_unstamped',
+                    'forward_lidar_angle_degrees': -90.0,
+                }
+            ]
         ),
     ])

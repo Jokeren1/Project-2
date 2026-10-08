@@ -12,7 +12,7 @@ from std_msgs.msg import Bool
 
 class ReactiveController(Node):
     """
-    Reactive behavior controller for Project 1.
+    Reactive behavior controller.
 
     Behavior priority:
     1. Halt on bumper collision
@@ -25,6 +25,40 @@ class ReactiveController(Node):
 
     def __init__(self):
         super().__init__('reactive_controller')
+
+        # ---------------------------------------------------------
+        # Configurable ROS parameters
+        # ---------------------------------------------------------
+
+        # Project 1 simulation used /cmd_vel_unstamped.
+        # This parameter allows Project 2 to use whatever velocity
+        # topic is required by the physical TurtleBot.
+        self.declare_parameter(
+            'cmd_vel_topic',
+            '/cmd_vel_unstamped'
+        )
+
+        # In the Project 1 simulation, the LiDAR frame was rotated
+        # +90 degrees relative to base_link. Therefore robot-forward
+        # corresponded to -90 degrees in the LaserScan frame.
+        #
+        # Making this configurable allows the physical TurtleBot's
+        # actual LiDAR orientation to be used without rewriting the
+        # obstacle-detection code.
+        self.declare_parameter(
+            'forward_lidar_angle_degrees',
+            -90.0
+        )
+
+        self.cmd_vel_topic = (
+            self.get_parameter('cmd_vel_topic').value
+        )
+
+        self.forward_lidar_angle_degrees = (
+            self.get_parameter(
+                'forward_lidar_angle_degrees'
+            ).value
+        )
 
         # ---------------------------------------------------------
         # ROS interfaces
@@ -56,6 +90,10 @@ class ReactiveController(Node):
         )
 
         # Gazebo contact information for the TurtleBot bumper.
+        #
+        # This is still the Project 1 simulation interface.
+        # It will be replaced with the physical TurtleBot bumper
+        # interface once that interface is verified on the robot.
         self.bumper_subscription = self.create_subscription(
             Contacts,
             '/bumper_contact',
@@ -63,12 +101,10 @@ class ReactiveController(Node):
             10
         )
 
-        # The TurtleBot simulation accepts an unstamped Twist on
-        # /cmd_vel_unstamped. motion_control consumes this topic
-        # and applies the command to the simulated robot.
+        # Publish final movement commands to the configured topic.
         self.cmd_publisher = self.create_publisher(
             Twist,
-            '/cmd_vel_unstamped',
+            self.cmd_vel_topic,
             10
         )
 
@@ -137,34 +173,24 @@ class ReactiveController(Node):
         self.center_distance = float('inf')
         self.right_distance = float('inf')
 
-        # The simulated LiDAR gives a full 360-degree scan.
+        # Only the front 90 degrees relative to the robot are used
+        # for obstacle behavior.
         #
-        # TF testing showed that its frame is rotated +90 degrees
-        # relative to base_link. Because of that:
-        #
-        #     TurtleBot forward = approximately -90 degrees
-        #     in the LaserScan coordinate frame.
-        #
-        # Only the front 90 degrees are used for obstacle behavior.
-        # This prevents walls beside or behind the robot from causing
-        # it to keep turning long after they are no longer in its path.
-        #
-        # LiDAR-relative sectors:
-        #
-        #     right:  -135 to -105 degrees
-        #     center: -105 to  -75 degrees
-        #     left:    -75 to  -45 degrees
-        #
-        # These correspond to robot-relative:
+        # Robot-relative sectors:
         #
         #     right:  -45 to -15 degrees
         #     center: -15 to +15 degrees
         #     left:   +15 to +45 degrees
         #
-        # The simulated LiDAR has a minimum valid range around
-        # 0.164 m. Very close objects can therefore fall inside
-        # the LiDAR blind region, which is why bumper detection
-        # remains the highest-priority behavior.
+        # forward_lidar_angle_degrees determines where robot-forward
+        # appears in the LaserScan coordinate frame.
+        #
+        # Project 1 simulation:
+        #
+        #     forward_lidar_angle_degrees = -90
+        #
+        # The physical TurtleBot value will be verified when the
+        # robot is available.
 
         # Used to prevent one stale LiDAR scan from immediately
         # triggering another escape after an escape completes.
@@ -205,6 +231,15 @@ class ReactiveController(Node):
             'Reactive controller initialized'
         )
 
+        self.get_logger().info(
+            f'Command velocity topic: {self.cmd_vel_topic}'
+        )
+
+        self.get_logger().info(
+            'LiDAR forward angle: '
+            f'{self.forward_lidar_angle_degrees:.1f} degrees'
+        )
+
     # -------------------------------------------------------------
     # Sensor / input callbacks
     # -------------------------------------------------------------
@@ -213,9 +248,8 @@ class ReactiveController(Node):
         """
         Process the front 90 degrees of the LiDAR.
 
-        Because the LiDAR frame is rotated +90 degrees relative
-        to base_link, -90 degrees in /scan corresponds to the
-        TurtleBot's forward direction.
+        The location of robot-forward in the LaserScan coordinate
+        frame is controlled by forward_lidar_angle_degrees.
         """
 
         self.scan_received = True
@@ -242,22 +276,31 @@ class ReactiveController(Node):
 
             angle_degrees = math.degrees(angle)
 
+            # Convert the LaserScan angle into an angle relative
+            # to the robot's forward direction.
+            relative_angle = (
+                angle_degrees
+                - self.forward_lidar_angle_degrees
+            )
+
+            # Normalize to [-180, 180].
+            relative_angle = (
+                (relative_angle + 180.0) % 360.0
+            ) - 180.0
+
             # Front-right:
             # Robot-relative -45 through -15 degrees.
-            # LiDAR-relative -135 through -105 degrees.
-            if -135.0 <= angle_degrees < -105.0:
+            if -45.0 <= relative_angle < -15.0:
                 right_ranges.append(distance)
 
             # Front-center:
             # Robot-relative -15 through +15 degrees.
-            # LiDAR-relative -105 through -75 degrees.
-            elif -105.0 <= angle_degrees <= -75.0:
+            elif -15.0 <= relative_angle <= 15.0:
                 center_ranges.append(distance)
 
             # Front-left:
             # Robot-relative +15 through +45 degrees.
-            # LiDAR-relative -75 through -45 degrees.
-            elif -75.0 < angle_degrees <= -45.0:
+            elif 15.0 < relative_angle <= 45.0:
                 left_ranges.append(distance)
 
         # Store the closest obstacle in each front region.
@@ -312,7 +355,10 @@ class ReactiveController(Node):
 
     def bumper_callback(self, msg):
         """
-        Detect contact involving the TurtleBot bumper.
+        Detect contact involving the simulated TurtleBot bumper.
+
+        This callback currently uses the Project 1 Gazebo contact
+        interface and will be updated for the physical TurtleBot.
         """
 
         for contact in msg.contacts:
