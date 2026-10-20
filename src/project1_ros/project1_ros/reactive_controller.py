@@ -5,7 +5,7 @@ import rclpy
 from rclpy.node import Node
 
 from geometry_msgs.msg import Twist
-from ros_gz_interfaces.msg import Contacts
+from irobot_create_msgs.msg import HazardDetection, HazardDetectionVector
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool
 
@@ -89,14 +89,10 @@ class ReactiveController(Node):
             10
         )
 
-        # Gazebo contact information for the TurtleBot bumper.
-        #
-        # This is still the Project 1 simulation interface.
-        # It will be replaced with the physical TurtleBot bumper
-        # interface once that interface is verified on the robot.
+        # Physical TurtleBot 4 bumper and safety hazard reports.
         self.bumper_subscription = self.create_subscription(
-            Contacts,
-            '/bumper_contact',
+            HazardDetectionVector,
+            '/hazard_detection',
             self.bumper_callback,
             10
         )
@@ -156,10 +152,9 @@ class ReactiveController(Node):
 
         self.bumper_active = False
         self.last_bumper_time = None
+        self.hazard_cleared = False
 
-        # /bumper_contact repeatedly publishes while contact exists.
-        # If no new bumper message arrives for 0.30 seconds,
-        # the collision is considered cleared.
+        # Wait briefly after a confirmed clear message before resuming.
         self.bumper_clear_timeout = 0.30
 
         # ---------------------------------------------------------
@@ -354,29 +349,30 @@ class ReactiveController(Node):
         self.last_keyboard_time = self.current_time_seconds()
 
     def bumper_callback(self, msg):
-        """
-        Detect contact involving the simulated TurtleBot bumper.
+        """Stop for physical bumper, cliff, stall, or wheel-drop hazards."""
+        safety_hazards = {
+            HazardDetection.BUMP,
+            HazardDetection.CLIFF,
+            HazardDetection.STALL,
+            HazardDetection.WHEEL_DROP,
+        }
+        hazard_detected = any(
+            detection.type in safety_hazards
+            for detection in msg.detections
+        )
 
-        This callback currently uses the Project 1 Gazebo contact
-        interface and will be updated for the physical TurtleBot.
-        """
-
-        for contact in msg.contacts:
-            collision1 = contact.collision1.name
-            collision2 = contact.collision2.name
-
-            if (
-                'turtlebot4::bumper::bumper_collision' in collision1
-                or
-                'turtlebot4::bumper::bumper_collision' in collision2
-            ):
-                # Repeated contact messages continually update this
-                # timestamp, keeping the halt behavior active for
-                # as long as physical contact remains.
-                self.bumper_active = True
-                self.last_bumper_time = self.current_time_seconds()
-
-                return
+        if hazard_detected:
+            if not self.bumper_active:
+                self.get_logger().warn(
+                    'Physical bumper or safety hazard detected. Stopping.'
+                )
+            self.bumper_active = True
+            self.hazard_cleared = False
+            self.last_bumper_time = self.current_time_seconds()
+            self.stop_robot()
+        elif self.bumper_active:
+            # An empty/clear message confirms the hazard is no longer active.
+            self.hazard_cleared = True
 
     # -------------------------------------------------------------
     # Main behavior arbitration
@@ -394,18 +390,18 @@ class ReactiveController(Node):
         # ---------------------------------------------------------
 
         if self.bumper_active:
+            if not self.hazard_cleared:
+                self.stop_robot()
+                return
 
             if (
                 self.last_bumper_time is not None
-                and
-                current_time - self.last_bumper_time
+                and current_time - self.last_bumper_time
                 <= self.bumper_clear_timeout
             ):
                 self.stop_robot()
                 return
 
-            # Contact has cleared.
-            # Return control to the remaining behaviors.
             self.bumper_active = False
             self.last_bumper_time = None
 
@@ -771,6 +767,7 @@ def main(args=None):
         pass
 
     finally:
+        controller.stop_robot()
         controller.destroy_node()
         rclpy.try_shutdown()
 
